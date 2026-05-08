@@ -3,143 +3,181 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
-const char* ssid = "DIGIFIBRA-86AC";
-const char* password = "yN4+rX8pKQ";
+// --- CONFIGURACIÓN DE RED ---
+const char* ssid = "";
+const char* password = "";
 
 ESP8266WebServer server(80);
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
 
-// Calibración MG996R (Puertos 0, 1, 2)
+// --- CALIBRACIÓN DE SERVOS ---
+// MG996R (Puertos 0, 1, 2)
 #define MG996_MIN  102 
 #define MG996_MAX  512 
-
-// Calibración SG90 (Puerto 3) 
-// El SG90 suele ser feliz entre 120 y 480 para evitar forzar el plástico
+// SG90 (Puerto 3)
 #define SG90_MIN   120 
 #define SG90_MAX   480 
 
-int currentAngles[4] = {90, 90, 90, 90};
-int globalStepDelay = 15; 
+// --- VARIABLES DE ESTADO ---
+float currentAngles[4] = {90, 90, 90, 90};
+int targetAngles[4] = {90, 90, 90, 90};
+unsigned long lastMoveTime = 0;
+int globalStepDelay = 15; // Delay entre pasos (ms)
 bool emergencyStop = false;
 
-void moveServoSlow(int port, int targetAngle) {
+// --- LÓGICA DE MOVIMIENTO SUAVE (ASÍNCRONA) ---
+void updateServos() {
   if (emergencyStop) return;
-  int startAngle = currentAngles[port];
-  if (targetAngle == startAngle) return;
-  int step = (targetAngle > startAngle) ? 1 : -1;
-  
-  for (int pos = startAngle; pos != targetAngle + step; pos += step) {
-    if (emergencyStop) break;
-    
-    // Mapeo diferenciado: Puertos 0-2 usan límites MG996, Puerto 3 usa SG90
-    int pulse = (port == 3) ? map(pos, 0, 180, SG90_MIN, SG90_MAX) : map(pos, 0, 180, MG996_MIN, MG996_MAX);
-    
-    pwm.setPWM(port, 0, pulse);
-    delay(globalStepDelay); 
-    server.handleClient();
+
+  if (millis() - lastMoveTime >= (unsigned long)globalStepDelay) {
+    lastMoveTime = millis();
+    bool moving = false;
+
+    for (int i = 0; i < 4; i++) {
+      if (abs(currentAngles[i] - targetAngles[i]) > 0.5) {
+        moving = true;
+        if (currentAngles[i] < targetAngles[i]) currentAngles[i] += 1.0;
+        else currentAngles[i] -= 1.0;
+
+        int pulse = (i == 3) ? 
+                    map((int)currentAngles[i], 0, 180, SG90_MIN, SG90_MAX) : 
+                    map((int)currentAngles[i], 0, 180, MG996_MIN, MG996_MAX);
+        
+        pwm.setPWM(i, 0, pulse);
+      }
+    }
   }
-  currentAngles[port] = targetAngle;
 }
 
+// --- MANEJADORES DEL SERVIDOR WEB ---
 void handleRoot() {
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1' charset='utf-8'>";
   html += "<style>body{font-family:'Segoe UI',sans-serif; text-align:center; background:#eceff1; padding:20px; color:#333;}";
-  html += ".card{background:white; padding:20px; border-radius:15px; margin:15px auto; max-width:450px; box-shadow:0 4px 6px rgba(0,0,0,0.1);}";
-  html += ".slider{width:100%; height:15px; border-radius:5px; background:#d7ccc8; outline:none; margin:15px 0;}";
-  html += ".btn-container{display:flex; flex-direction:column; gap:10px; align-items:center;}";
-  html += ".btn{width:100%; max-width:400px; padding:15px; border:none; border-radius:10px; color:white; font-size:16px; font-weight:bold; cursor:pointer;}";
-  html += ".btn-panic{background:#d32f2f;} .btn-center{background:#1976d2;} .btn-on{background:#388e3c;}";
-  html += "h3{margin:5px 0; font-size:18px; color:#455a64;}</style></head><body>";
+  html += ".card{background:white; padding:15px; border-radius:15px; margin:10px auto; max-width:500px; box-shadow:0 4px 6px rgba(0,0,0,0.1);}";
+  html += ".control-group{display:flex; align-items:center; gap:10px; margin-top:10px;}";
+  html += ".slider{flex-grow:1; height:15px; border-radius:5px; background:#d7ccc8; outline:none;}";
+  html += ".btn-small{padding:10px; border:none; border-radius:8px; background:#455a64; color:white; font-weight:bold; cursor:pointer; min-width:55px;}";
+  html += ".btn-panic{background:#d32f2f; width:100%; padding:15px; color:white; border:none; border-radius:10px; font-weight:bold; margin-bottom:10px;}";
+  html += ".btn-action{background:#1976d2; width:48%; padding:10px; color:white; border:none; border-radius:10px; font-weight:bold;}";
+  html += "h3{margin:5px 0; font-size:16px; color:#455a64;}</style></head><body>";
   
-  html += "<h1>PETG Arm Controller</h1>";
+  html += "<h1>Control Brazo PETG</h1>";
 
-  // Panel de Botones (Fijos, sin recarga de página)
-  html += "<div class='card btn-container'>";
-  html += "<button class='btn btn-panic' onclick='fetch(\"/panic\")'>PARADA DE EMERGENCIA</button>";
-  html += "<button class='btn btn-on' onclick='fetch(\"/reset_safety\")'>ACTIVAR MOTORES</button>";
-  html += "<button class='btn btn-center' onclick='centerJS()'>CENTRAR TODO (90&deg;)</button>";
-  html += "</div>";
+  // Panel de Seguridad
+  html += "<div class='card'>";
+  html += "<button class='btn-panic' onclick='fetch(\"/panic\")'>PARADA DE EMERGENCIA</button>";
+  html += "<div style='display:flex; justify-content:space-between;'>";
+  html += "<button class='btn-action' style='background:#388e3c' onclick='fetch(\"/reset_safety\")'>ACTIVAR MOTORES</button>";
+  html += "<button class='btn-action' onclick='centerJS()'>CENTRAR TODO</button></div></div>";
 
-  // Control de Velocidad
-  html += "<div class='card' style='background:#37474f; color:white;'><h3>Velocidad: <span id='vSpd'>" + String(globalStepDelay) + "</span>ms</h3>";
-  html += "<input type='range' min='1' max='100' value='" + String(globalStepDelay) + "' class='slider' onchange='updateSpeed(this.value)'></div>";
+  // Slider de Velocidad (Invertido lógicamente: derecha = más rápido)
+  int speedVal = 101 - globalStepDelay;
+  html += "<div class='card' style='background:#37474f; color:white;'><h3>Velocidad de Movimiento: <span id='vSpd'>" + String(speedVal) + "</span></h3>";
+  html += "<input type='range' min='1' max='100' value='" + String(speedVal) + "' class='slider' onchange='updateSpeed(this.value)'></div>";
 
-  // Sliders de Servos
+  // Sliders de los 4 Servos
+  const char* names[] = {"Base (P0)", "Codo (P1)", "Hombro (P2)", "Pinza (P3)"};
   for(int i=0; i<4; i++) {
-    String label = (i==0)?"Base (P0)":(i==1)?"Codo (P1)":(i==2)?"Hombro (P2)":"Pinza SG90 (P3)";
-    html += "<div class='card'><h3>" + label + ": <span id='v" + String(i) + "'>" + String(currentAngles[i]) + "</span>&deg;</h3>";
-    html += "<input type='range' min='0' max='180' value='" + String(currentAngles[i]) + "' class='slider' id='s" + String(i) + "' onchange='moveServo(" + String(i) + ", this.value)'></div>";
+    html += "<div class='card'><h3>" + String(names[i]) + ": <span id='v" + String(i) + "'>" + String((int)currentAngles[i]) + "</span>&deg;</h3>";
+    html += "<div class='control-group'>";
+    html += "<button class='btn-small' onclick='moveServo(" + String(i) + ", 0)'>0&deg;</button>";
+    html += "<input type='range' min='0' max='180' value='" + String((int)currentAngles[i]) + "' class='slider' id='s" + String(i) + "' oninput='moveServo(" + String(i) + ", this.value)'>";
+    html += "<button class='btn-small' onclick='moveServo(" + String(i) + ", 180)'>180&deg;</button>";
+    html += "</div></div>";
   }
 
   html += "<script>";
-  html += "function moveServo(port, val) { document.getElementById('v' + port).innerHTML = val; fetch('/setAngle?port=' + port + '&deg=' + val); }";
-  html += "function updateSpeed(val) { document.getElementById('vSpd').innerHTML = val; fetch('/setSpeed?ms=' + val); }";
-  html += "function centerJS() { for(let i=0; i<4; i++){ document.getElementById('v'+i).innerHTML=90; document.getElementById('s'+i).value=90; } fetch('/center'); }";
+  html += "let lastCall = 0;";
+  html += "function moveServo(port, val) {";
+  html += "  document.getElementById('v' + port).innerHTML = val;";
+  html += "  document.getElementById('s' + port).value = val;";
+  html += "  let now = Date.now(); if (now - lastCall > 40) {";
+  html += "    fetch('/setAngle?port=' + port + '&deg=' + val); lastCall = now; } }";
+  html += "function updateSpeed(val) { document.getElementById('vSpd').innerHTML = val; fetch('/setSpeed?spd=' + val); }";
+  html += "function centerJS() { for(let i=0; i<4; i++){ moveServo(i, 90); } fetch('/center'); }";
   html += "</script></body></html>";
   
   server.send(200, "text/html", html);
 }
 
-void handlePanic() {
-  emergencyStop = true;
-  for(int i=0; i<16; i++) pwm.setPWM(i, 0, 4096); 
-  server.send(200, "text/plain", "STOPPED");
-}
-
-void handleResetSafety() {
-  emergencyStop = false;
-  for(int i=0; i<4; i++) {
-    int pulse = (i==3) ? map(currentAngles[i], 0, 180, SG90_MIN, SG90_MAX) : map(currentAngles[i], 0, 180, MG996_MIN, MG996_MAX);
-    pwm.setPWM(i, 0, pulse);
-  }
-  server.send(200, "text/plain", "MOTORS_ON");
-}
-
 void handleAngle() {
   if (!emergencyStop && server.hasArg("port") && server.hasArg("deg")) {
-    moveServoSlow(server.arg("port").toInt(), server.arg("deg").toInt());
+    int p = server.arg("port").toInt();
+    int d = server.arg("deg").toInt();
+    if (p >= 0 && p < 4) {
+      targetAngles[p] = d;
+      Serial.printf("WEB: Puerto %d -> Objetivo %d°\n", p, d);
+    }
   }
   server.send(200, "text/plain", "OK");
 }
 
 void handleSpeed() {
-  if (server.hasArg("ms")) {
-    globalStepDelay = server.arg("ms").toInt();
+  if (server.hasArg("spd")) {
+    int s = server.arg("spd").toInt();
+    globalStepDelay = 101 - s; // Inversión lógica
+    Serial.printf("WEB: Velocidad ajustada. Delay: %d ms\n", globalStepDelay);
     server.send(200, "text/plain", "OK");
   }
 }
 
-void handleCenter() {
-  if (!emergencyStop) {
-    for(int i=0; i<4; i++) moveServoSlow(i, 90);
-  }
-  server.send(200, "text/plain", "CENTERED");
+void handlePanic() {
+  emergencyStop = true;
+  for(int i=0; i<16; i++) pwm.setPWM(i, 0, 4096); // Corta señal PWM
+  Serial.println("!!! EMERGENCIA: MOTORES DESACTIVADOS !!!");
+  server.send(200, "text/plain", "STOP");
 }
 
+void handleResetSafety() {
+  emergencyStop = false;
+  Serial.println("SEGURIDAD: Motores re-activados.");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleCenter() {
+  if (!emergencyStop) {
+    for(int i=0; i<4; i++) targetAngles[i] = 90;
+    Serial.println("WEB: Centrando todos los ejes.");
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+// --- SETUP ---
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n\n--- CONTROL BRAZO PETG v2.0 ---");
+
   pwm.begin();
   pwm.setPWMFreq(50);
-  
-  // Posición inicial (90 grados para todos)
-  for(int i=0; i<4; i++) {
-    int pulse = (i==3) ? map(90, 0, 180, SG90_MIN, SG90_MAX) : map(90, 0, 180, MG996_MIN, MG996_MAX);
-    pwm.setPWM(i, 0, pulse);
-  }
+  Serial.println("Driver PCA9685 OK");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  Serial.print("Conectando a WiFi");
   
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi CONECTADO");
+  Serial.print("IP del Brazo: ");
+  Serial.println(WiFi.localIP());
+
   server.on("/", handleRoot);
   server.on("/setAngle", handleAngle);
   server.on("/setSpeed", handleSpeed);
   server.on("/panic", handlePanic);
   server.on("/reset_safety", handleResetSafety);
   server.on("/center", handleCenter);
+  
   server.begin();
+  Serial.println("Servidor Web listo.");
 }
 
+// --- LOOP ---
 void loop() {
   server.handleClient();
+  updateServos();
 }
